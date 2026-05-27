@@ -72,6 +72,9 @@ export const ALWAYS_ARRAY_TAGS = new Set<string>([
   'office',
   // <dimensions><dimension name="...">CODE</dimension>...</dimensions>
   'dimension',
+  // <browse><th><td>...</td></th><tr><td>...</td>...</tr>...</browse>
+  'td',
+  'tr',
 ]);
 
 /**
@@ -496,6 +499,34 @@ export class TwinfieldClient {
     return result;
   }
 
+  // ── Browse-query helper ──────────────────────────────────────────────────
+
+  /**
+   * Execute a Twinfield browse query (`<columns code="…">`) via ProcessXml.
+   *
+   * Browse queries are how Twinfield exposes its tabular reports — e.g.
+   * transaction lists, outstanding-invoice listings, GL movements. Each
+   * column is identified by a Twinfield field id like `fin.trs.head.code`
+   * or `fin.trs.line.valuesigned`. Visible columns appear in the response;
+   * filter columns (with `filter.operator` set) constrain the rows.
+   *
+   * Not every field id is valid in every browse code, and not every
+   * combination of fields is accepted by Twinfield's browse engine — some
+   * fields (e.g. unsigned amount fields, certain dim1 combinations) trigger
+   * generic server-side faults instead of a graceful "field doesn't exist"
+   * message. When iterating, isolate each new field in its own probe call
+   * to get a clean error.
+   *
+   * Returns the normalised browse result; callers don't need to know about
+   * the underlying `<browse><th><td>…` shape.
+   */
+  async callBrowse(options: { office?: string; code: string; columns: BrowseColumn[] }): Promise<BrowseResult> {
+    const { office, code, columns } = options;
+    const xml = buildColumnsXml(code, columns);
+    const raw = await this.callProcessXml({ office, xmlBody: xml });
+    return normalizeBrowseResult(raw);
+  }
+
   // ── Envelope / parsing helpers ───────────────────────────────────────────
 
   /**
@@ -700,6 +731,131 @@ function formatRateLimitHeaders(headers: unknown): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Browse query types + helpers ───────────────────────────────────────────
+
+export type BrowseOperator = 'equal' | 'notequal' | 'between' | 'greaterequal' | 'lessequal' | 'like' | 'in';
+
+export interface BrowseColumn {
+  /** Twinfield field id, e.g. `fin.trs.head.code` or `fin.trs.line.valuesigned`. */
+  field: string;
+  /** Display label. Required by Twinfield's browse engine. */
+  label: string;
+  /** Whether this column appears in the output. Defaults to true. */
+  visible?: boolean;
+  /** Optional filter on this column. `to` is only used for `between`. */
+  filter?: { operator: BrowseOperator; from: string; to?: string };
+}
+
+export interface BrowseCell {
+  /** Raw value as parsed (number, string, or boolean). */
+  value: unknown;
+  /** Twinfield type hint (`String`, `Decimal`, `Date`, `Value`, …). */
+  type?: string;
+  /** Optional formatted variant Twinfield supplies for dates and enums. */
+  formatted?: string;
+}
+
+export interface BrowseHeader {
+  field: string;
+  label: string;
+  type?: string;
+}
+
+export interface BrowseRow {
+  /** Natural key Twinfield returns alongside each row. */
+  key: Record<string, unknown>;
+  /** Cells keyed by Twinfield field id, matching the headers. */
+  cells: Record<string, BrowseCell>;
+}
+
+export interface BrowseResult {
+  headers: BrowseHeader[];
+  rows: BrowseRow[];
+  /** Twinfield's `@_total` attribute, when present. */
+  total?: number;
+}
+
+function buildColumnsXml(code: string, columns: BrowseColumn[]): string {
+  const colXml = columns
+    .map((c) => {
+      const parts = [
+        `<field>${escapeXml(c.field)}</field>`,
+        `<label>${escapeXml(c.label)}</label>`,
+        `<visible>${c.visible === false ? 'false' : 'true'}</visible>`,
+      ];
+      if (c.filter) {
+        parts.push(`<operator>${escapeXml(c.filter.operator)}</operator>`);
+        parts.push(`<from>${escapeXml(c.filter.from)}</from>`);
+        if (c.filter.to !== undefined) parts.push(`<to>${escapeXml(c.filter.to)}</to>`);
+      }
+      return `<column>${parts.join('')}</column>`;
+    })
+    .join('');
+  return `<columns code="${escapeXml(code)}">${colXml}</columns>`;
+}
+
+function normalizeBrowseResult(parsed: unknown): BrowseResult {
+  if (!parsed || typeof parsed !== 'object') {
+    return { headers: [], rows: [] };
+  }
+  const browse = ((parsed as Record<string, unknown>)['browse'] ?? parsed) as Record<string, unknown>;
+
+  // Twinfield's "structured error" path: result=0 with a msg attribute.
+  const resultAttr = browse['@_result'];
+  if (resultAttr !== undefined && resultAttr !== 1 && resultAttr !== '1') {
+    const msg = browse['@_msg'] ?? browse['msg'];
+    throw new Error(
+      `Twinfield browse call failed (result=${String(resultAttr)})${msg ? `: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}` : ''}`,
+    );
+  }
+
+  const headers = extractBrowseHeaders(browse['th']);
+  const rows = extractBrowseRows(browse['tr']);
+  const totalRaw = browse['@_total'];
+  const total = typeof totalRaw === 'number' ? totalRaw : typeof totalRaw === 'string' ? Number(totalRaw) : undefined;
+
+  return { headers, rows, total: Number.isFinite(total) ? total : undefined };
+}
+
+function extractBrowseHeaders(th: unknown): BrowseHeader[] {
+  if (!th || typeof th !== 'object') return [];
+  const tds = (th as Record<string, unknown>)['td'];
+  const arr = Array.isArray(tds) ? tds : tds === undefined ? [] : [tds];
+  return arr.map((entry) => {
+    if (typeof entry !== 'object' || entry === null) return { field: String(entry), label: '' };
+    const obj = entry as Record<string, unknown>;
+    const field = String(obj['#text'] ?? '');
+    const label = typeof obj['@_label'] === 'string' ? (obj['@_label'] as string) : '';
+    const type = typeof obj['@_type'] === 'string' ? (obj['@_type'] as string) : undefined;
+    return { field, label, type };
+  });
+}
+
+function extractBrowseRows(tr: unknown): BrowseRow[] {
+  if (tr === undefined) return [];
+  const arr = Array.isArray(tr) ? tr : [tr];
+  return arr.map((row) => {
+    if (typeof row !== 'object' || row === null) return { key: {}, cells: {} };
+    const obj = row as Record<string, unknown>;
+    const tds = obj['td'];
+    const cellArr = Array.isArray(tds) ? tds : tds === undefined ? [] : [tds];
+    const cells: Record<string, BrowseCell> = {};
+    for (const cell of cellArr) {
+      if (typeof cell !== 'object' || cell === null) continue;
+      const c = cell as Record<string, unknown>;
+      const field = typeof c['@_field'] === 'string' ? (c['@_field'] as string) : null;
+      if (!field) continue;
+      cells[field] = {
+        value: c['#text'],
+        type: typeof c['@_type'] === 'string' ? (c['@_type'] as string) : undefined,
+        formatted: typeof c['@_name'] === 'string' ? (c['@_name'] as string) : undefined,
+      };
+    }
+    const keyObj = (obj['key'] as Record<string, unknown> | undefined) ?? {};
+    return { key: keyObj, cells };
+  });
 }
 
 /**

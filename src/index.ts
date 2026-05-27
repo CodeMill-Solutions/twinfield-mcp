@@ -5,6 +5,7 @@ import { TwinfieldClient, loadCredentialsFile, type TwinfieldOfficeCredentials }
 import { registerAuthTools } from './tools/auth.js';
 import { registerOfficeTools } from './tools/offices.js';
 import { registerDimensionTools } from './tools/dimensions.js';
+import { registerTransactionTools } from './tools/transactions.js';
 
 // ── Credentials map ───────────────────────────────────────────────────────────
 //
@@ -79,12 +80,13 @@ const twinfieldClient = new TwinfieldClient(defaultOffice, credentialsMap);
 
 const server = new McpServer({
   name: 'twinfield-mcp',
-  version: '0.1.1',
+  version: '0.2.0',
 });
 
 registerAuthTools(server, twinfieldClient);
 registerOfficeTools(server, twinfieldClient);
 registerDimensionTools(server, twinfieldClient);
+registerTransactionTools(server, twinfieldClient);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
@@ -98,8 +100,8 @@ const credInfo =
     : 'no credentials configured';
 
 process.stderr.write(
-  `[twinfield-mcp] Server started — 8 tools registered ` +
+  `[twinfield-mcp] Server started — 11 tools registered ` +
     `(whoami, reload_credentials, list_offices, get_customers, get_suppliers, get_gl_accounts, ` +
-    `get_cost_centers, get_projects). ` +
+    `get_cost_centers, get_projects, get_transactions, get_sales_invoices, get_purchase_invoices). ` +
     `Default office: ${defaultOffice || '(none)'} — ${credInfo}\n`,
 );

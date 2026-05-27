@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that co
 
 Built with Node.js, TypeScript, and [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk).
 
-> **Status: v0.1.0 — read-only preview.** Covers authentication, office discovery, and dimension reads (customers, suppliers, GL accounts, cost centres, projects). Browse-based reads (transactions, invoices) and write tools are planned for v0.2+.
+> **Status: v0.2.0 — read-only.** Covers authentication, office discovery, dimension reads (customers, suppliers, GL accounts, cost centres, projects), and browse-based transaction reads (general transactions, sales invoices, purchase invoices). Write tools are planned for v0.3+.
 
 ---
 
@@ -134,7 +134,7 @@ When a new office entry is added externally — e.g. by running `npm run authori
 
 ---
 
-## Available tools (8)
+## Available tools (11)
 
 ### Authentication & setup
 
@@ -163,6 +163,26 @@ Twinfield models customers, suppliers, GL accounts, cost centres, and projects a
 
 All dimension tools return an array of `{ code, name?, shortname? }` entries.
 
+### Transactions (browse queries)
+
+Built on Twinfield's `<columns code="100">` browse query. Each row in the response is one transaction *line* with daybook, number, date, year-period, counterparty (`fin.trs.line.dim2`), match status, signed amount, and signed open amount.
+
+| Tool | Default daybook | Description |
+|------|-----------------|-------------|
+| `get_transactions` | — | List transactions filtered by daybook code, year-period range, and/or counterparty. Run without filters to discover the daybook codes used on this office. |
+| `get_sales_invoices` | `VRK` | Sales invoice lines. Pass `openOnly=true` to keep only unpaid lines. |
+| `get_purchase_invoices` | `INK` | Purchase invoice lines. Pass `openOnly=true` to keep only unpaid lines. |
+
+**Common parameters** for all three:
+
+- `office?: string` — override the default office.
+- `daybook?: string` — Twinfield daybook code (`VRK`, `INK`, `BNK`, `KAS`, `MEMO`, …). Overrides the per-tool default.
+- `yearperiodFrom?: string`, `yearperiodTo?: string` — inclusive range in `YYYY/PP` format (e.g. `2024/01` to `2024/12`). Must be supplied together.
+- `counterparty?: string` — filter to a single customer/supplier code.
+- `openOnly?: boolean` — client-side post-filter that keeps only rows whose match status is `available` (only on `get_sales_invoices` / `get_purchase_invoices`).
+
+> **Note on daybook codes.** `VRK` and `INK` are the Dutch defaults (Verkoop / Inkoop). Offices on a non-Dutch Twinfield template may use different codes — run `get_transactions` once without filters and inspect the `daybook` field on the result to see what your office uses.
+
 ---
 
 ## Testing
@@ -182,7 +202,6 @@ For quick command-line validation without the MCP layer:
 ```bash
 npx tsx scripts/whoami.ts            # exercises refresh + cluster + userinfo
 npx tsx scripts/list-offices.ts      # exercises the ProcessXml SOAP path
-npx tsx scripts/explore.ts <kind>    # ad-hoc ProcessXml payloads — see the script for kinds
 ```
 
 ---
@@ -196,14 +215,15 @@ src/
 └── tools/
     ├── auth.ts               # whoami, reload_credentials
     ├── offices.ts            # list_offices
-    └── dimensions.ts         # get_customers, get_suppliers, get_gl_accounts,
-                              # get_cost_centers, get_projects
+    ├── dimensions.ts         # get_customers, get_suppliers, get_gl_accounts,
+    │                         # get_cost_centers, get_projects
+    └── transactions.ts       # get_transactions, get_sales_invoices,
+                              # get_purchase_invoices
 
 scripts/
 ├── authorize.ts              # One-time interactive OAuth2 authorization-code flow
 ├── whoami.ts                 # Standalone auth-chain probe
-├── list-offices.ts           # Standalone ProcessXml probe
-└── explore.ts                # Ad-hoc payload exploration
+└── list-offices.ts           # Standalone ProcessXml probe
 ```
 
 ### Auth flow
