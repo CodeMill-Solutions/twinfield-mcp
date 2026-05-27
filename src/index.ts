@@ -79,7 +79,7 @@ const twinfieldClient = new TwinfieldClient(defaultOffice, credentialsMap);
 
 const server = new McpServer({
   name: 'twinfield-mcp',
-  version: '0.1.0',
+  version: '0.1.1',
 });
 
 registerAuthTools(server, twinfieldClient);

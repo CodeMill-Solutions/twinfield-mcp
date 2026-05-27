@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-27
+
+### Changed
+
+- Scrubbed a real Twinfield office code that had leaked into README examples
+  and one JSDoc comment in `src/tools/dimensions.ts`. Replaced with neutral
+  placeholders (`your-office-code`, `OFFICE_CODE_A`, etc.). No runtime
+  behaviour change.
+
 ## [0.1.0] - 2026-05-27
 
 Initial public release — read-only preview.

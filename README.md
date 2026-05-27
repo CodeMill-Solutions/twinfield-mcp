@@ -23,7 +23,7 @@ Then add it to your MCP host configuration (e.g. `claude_desktop_config.json`):
       "command": "node",
       "args": ["node_modules/@codemill-solutions/twinfield-mcp/dist/index.js"],
       "env": {
-        "TWINFIELD_OFFICE_CODE": "NLA02994597"
+        "TWINFIELD_OFFICE_CODE": "your-office-code"
       }
     }
   }
@@ -86,7 +86,7 @@ npm run build
       "command": "node",
       "args": ["/absolute/path/to/twinfield-mcp/dist/index.js"],
       "env": {
-        "TWINFIELD_OFFICE_CODE": "NLA02994597"
+        "TWINFIELD_OFFICE_CODE": "your-office-code"
       }
     }
   }
@@ -105,12 +105,12 @@ If you manage **multiple organisations** (each with its own client_id/client_sec
 
 ```json
 {
-  "NLA02994597": {
-    "clientId": "TwinfieldMCP",
+  "OFFICE_CODE_A": {
+    "clientId": "...",
     "clientSecret": "...",
     "refreshToken": "..."
   },
-  "OTHER_OFFICE": {
+  "OFFICE_CODE_B": {
     "clientId": "...",
     "clientSecret": "...",
     "refreshToken": "..."
@@ -225,7 +225,7 @@ The SOAP header is the OAuth2 variant of Twinfield's legacy session-based header
 <soap:Header>
   <Header xmlns="http://www.twinfield.com/">
     <AccessToken>...</AccessToken>
-    <CompanyCode>NLA02994597</CompanyCode>
+    <CompanyCode>YOUR-OFFICE-CODE</CompanyCode>
     <CompanyId xsi:nil="true" />
   </Header>
 </soap:Header>

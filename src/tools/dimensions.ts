@@ -16,7 +16,7 @@ import { TwinfieldClient } from '../twinfield-client.js';
  * The list query is the same in all cases:
  *   <list>
  *     <type>dimensions</type>
- *     <office>NLA02994597</office>
+ *     <office>YOUR-OFFICE-CODE</office>
  *     <dimtype>DEB</dimtype>
  *   </list>
  *
