@@ -1,0 +1,5 @@
+resources/js/components/ui/*
+resources/views/mail/*
+node_modules
+dist
+coverage
