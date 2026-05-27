@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-27
+
+### Added
+
+- **Write tools** — first three writes against the Twinfield ProcessXml endpoint:
+  - `upsert_customer` (`<dimensions><dimension type="DEB">`) — create or
+    update a customer. Idempotent on `<code>`. Office-configured code
+    pattern is enforced server-side and surfaced verbatim on error.
+  - `upsert_supplier` (`<dimensions><dimension type="CRD">`) — same for
+    suppliers.
+  - `process_journal` (`<transaction destiny="…">`) — post a general
+    journal entry (memoriaal). Defaults to `destiny="temporary"` so the
+    entry lands as a draft that can be reviewed and finalised in the
+    Twinfield UI; pass `destiny="final"` to commit immediately. Validates
+    debit/credit balance client-side and surfaces nested per-field errors
+    (e.g. `lines.line[0].dim1: Dimensie 99999 komt niet voor …`).
+- `get_office` — read full details for a single office (currencies, VAT/CoC
+  numbers, default bank, region, address, fiscal config, …). Returns a
+  curated summary plus the full raw response under `details`.
+- `padDimensionCode(code, width=4)` exported from `twinfield-client` — works
+  around Twinfield's read-write inconsistency where reads return `110` but
+  writes require the storage form `0110`. Applied automatically by
+  `process_journal` to all `dim1`/`dim2`/`dim3` values.
+
+### Notes on Twinfield write quirks (discovered + documented in code)
+
+- The transaction draft attribute is **`destiny`** (`temporary`/`final`),
+  not `status`. Wrong attribute → "Incorrecte XML - de bestemming is
+  ongeldig."
+- `<inuse>` is NOT accepted on dimension upserts — Twinfield rejects it
+  with "Het element 'inuse' mag niet worden aangeleverd." The
+  active/inactive state is managed via a separate operation.
+- `<read><type>office>` requires BOTH `<office>` (context) and `<code>`
+  (identifier), even when they refer to the same office. Without `<code>`
+  Twinfield returns the misleading "U hebt geen toegang tot deze
+  administratie."
+- Field-level write errors live on the offending sub-element
+  (e.g. `line.dim1.@_msg`), not on the parent line. Our normalizer
+  recursively collects every `@_msg` in the response.
+
 ## [0.2.0] - 2026-05-27
 
 ### Added

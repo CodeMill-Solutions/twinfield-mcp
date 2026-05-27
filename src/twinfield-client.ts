@@ -859,6 +859,23 @@ function extractBrowseRows(tr: unknown): BrowseRow[] {
 }
 
 /**
+ * Zero-pad a numeric dimension code to `width` digits.
+ *
+ * Twinfield's read APIs return dimension codes with leading zeros stripped
+ * (e.g. GL account `110`) but the write APIs require the storage form with
+ * the leading zeros (`0110`). Without padding, journal-line writes fail with
+ * `Dimensie 110 komt niet voor in administratie …`.
+ *
+ * Codes that contain any non-digit character (e.g. project code `P0000`)
+ * are returned unchanged — those are stored verbatim.
+ */
+export function padDimensionCode(code: string | number, width = 4): string {
+  const s = String(code);
+  if (!/^\d+$/.test(s)) return s;
+  return s.length >= width ? s : s.padStart(width, '0');
+}
+
+/**
  * Escape special XML characters in a plain-text value.
  * Always call this before embedding user-supplied strings inside XML.
  */

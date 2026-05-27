@@ -1,6 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { TwinfieldClient, type BrowseColumn, type BrowseRow } from '../twinfield-client.js';
+import {
+  TwinfieldClient,
+  escapeXml,
+  padDimensionCode,
+  type BrowseColumn,
+  type BrowseRow,
+} from '../twinfield-client.js';
 
 /**
  * Register browse-based transaction read tools.
@@ -50,6 +56,8 @@ export function registerTransactionTools(server: McpServer, client: TwinfieldCli
       'Each row is one invoice line with date, supplier code, match status, amount, and open amount. ' +
       'Pass `openOnly=true` to keep only rows whose match status is `available` (unpaid).',
   });
+
+  registerProcessJournalTool(server, client);
 }
 
 interface TransactionToolSpec {
@@ -240,4 +248,235 @@ function cellNumberOrString(cell: { value: unknown } | undefined): number | stri
   if (typeof cell.value === 'number') return cell.value;
   if (typeof cell.value === 'string') return cell.value;
   return undefined;
+}
+
+// ── process_journal (write) ──────────────────────────────────────────────────
+
+/**
+ * Register `process_journal` — post a general journal entry (memoriaal).
+ *
+ * Twinfield's `<transaction>` write uses a `destiny` attribute (NOT
+ * `status`) with values `temporary` (draft, editable in the UI) or `final`
+ * (committed). We default to `temporary` so an agent can safely propose a
+ * booking that the user reviews and finalises in the Twinfield UI.
+ *
+ * Lines must balance to zero — sum of debit equals sum of credit. We
+ * validate this client-side so the agent gets a fast, clear error instead
+ * of a less-helpful Twinfield response.
+ *
+ * Dimension codes are auto-padded to 4 digits when they're purely numeric.
+ * This works around Twinfield's read-write inconsistency: reads return
+ * `110` but writes require the storage form `0110`.
+ */
+function registerProcessJournalTool(server: McpServer, client: TwinfieldClient): void {
+  const journalLineSchema = z.object({
+    dim1: z
+      .string()
+      .min(1)
+      .describe('Primary dimension code — usually the GL account. Numeric codes are auto-padded to 4 digits.'),
+    dim2: z
+      .string()
+      .optional()
+      .describe('Secondary dimension code — usually a customer or supplier. Auto-padded like dim1.'),
+    dim3: z
+      .string()
+      .optional()
+      .describe('Tertiary dimension — usually a cost centre or project. Auto-padded like dim1.'),
+    value: z.number().describe('Line amount in the transaction currency. Always positive; the `debitcredit` field carries the sign.'),
+    debitcredit: z.enum(['debit', 'credit']).describe('Whether this line is a debit or credit posting.'),
+    description: z.string().optional().describe('Free-text line description.'),
+  });
+
+  server.registerTool(
+    'process_journal',
+    {
+      description:
+        'Post a general journal entry (memoriaal). Lines must balance to zero — the sum of ' +
+        'debit values must equal the sum of credit values. Defaults to `destiny="temporary"` ' +
+        'so the entry lands as a draft that you can review and finalise in the Twinfield UI; ' +
+        'pass `destiny="final"` only when you are sure. Returns the Twinfield transaction number ' +
+        'on success — look it up under the daybook in the UI to verify.',
+      inputSchema: {
+        office: z
+          .string()
+          .optional()
+          .describe('Office code (CompanyCode). Defaults to TWINFIELD_OFFICE_CODE.'),
+        daybook: z
+          .string()
+          .optional()
+          .default('MEMO')
+          .describe('Daybook code, e.g. `MEMO` for memorial entries (default), or any other ' +
+            'configured journal code.'),
+        date: z.string().describe('Booking date in `YYYY-MM-DD` or `YYYYMMDD` format.'),
+        period: z
+          .string()
+          .regex(/^\d{4}\/\d{2}$/, 'Period must be in YYYY/PP format, e.g. 2024/01')
+          .describe('Fiscal period in `YYYY/PP` format. Must match the booking date\'s fiscal period.'),
+        currency: z.string().optional().default('EUR').describe('ISO currency code, e.g. `EUR`. Defaults to EUR.'),
+        lines: z
+          .array(journalLineSchema)
+          .min(2)
+          .describe('Journal lines. Must contain at least 2 lines and their debit/credit values must sum to zero.'),
+        destiny: z
+          .enum(['temporary', 'final'])
+          .optional()
+          .default('temporary')
+          .describe('`temporary` (default, safe) creates a draft you can review in Twinfield. ' +
+            '`final` commits the entry immediately.'),
+      },
+    },
+    async ({ office, daybook, date, period, currency, lines, destiny }) => {
+      try {
+        const resolvedOffice = office ?? client.defaultOfficeCode;
+        if (!resolvedOffice) {
+          throw new Error('No office code provided and TWINFIELD_OFFICE_CODE is not set.');
+        }
+
+        // Belt-and-braces defaults — the MCP SDK doesn't always apply Zod
+        // `.default()` to the parsed args, so we resolve them explicitly.
+        const effectiveDaybook = daybook ?? 'MEMO';
+        const effectiveCurrency = currency ?? 'EUR';
+        const effectiveDestiny = destiny ?? 'temporary';
+
+        // Balance validation
+        const totalDebit = lines.filter((l) => l.debitcredit === 'debit').reduce((s, l) => s + l.value, 0);
+        const totalCredit = lines.filter((l) => l.debitcredit === 'credit').reduce((s, l) => s + l.value, 0);
+        if (Math.abs(totalDebit - totalCredit) > 0.005) {
+          throw new Error(
+            `Journal lines do not balance: debit total ${totalDebit.toFixed(2)} ≠ credit total ${totalCredit.toFixed(2)}.`,
+          );
+        }
+
+        const normalizedDate = normalizeJournalDate(date);
+        const lineXml = lines
+          .map((l, i) => {
+            const parts = [
+              `<dim1>${escapeXml(padDimensionCode(l.dim1))}</dim1>`,
+              ...(l.dim2 ? [`<dim2>${escapeXml(padDimensionCode(l.dim2))}</dim2>`] : []),
+              ...(l.dim3 ? [`<dim3>${escapeXml(padDimensionCode(l.dim3))}</dim3>`] : []),
+              `<value>${l.value.toFixed(2)}</value>`,
+              `<debitcredit>${l.debitcredit}</debitcredit>`,
+              ...(l.description ? [`<description>${escapeXml(l.description)}</description>`] : []),
+            ];
+            return `<line id="${i + 1}">${parts.join('')}</line>`;
+          })
+          .join('');
+
+        const xmlBody = `<transaction destiny="${escapeXml(effectiveDestiny)}">
+          <header>
+            <office>${escapeXml(resolvedOffice)}</office>
+            <code>${escapeXml(effectiveDaybook)}</code>
+            <date>${escapeXml(normalizedDate)}</date>
+            <period>${escapeXml(period)}</period>
+            <currency>${escapeXml(effectiveCurrency)}</currency>
+          </header>
+          <lines>${lineXml}</lines>
+        </transaction>`;
+
+        const result = await client.callProcessXml({ office: resolvedOffice, xmlBody });
+
+        const normalized = normalizeJournalResult(result);
+        if (!normalized.success) {
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify({ success: false, error: normalized.error }, null, 2) },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  office: resolvedOffice,
+                  daybook: effectiveDaybook,
+                  number: normalized.number,
+                  date: normalizedDate,
+                  period,
+                  destiny: effectiveDestiny,
+                  lineCount: lines.length,
+                  totalAmount: totalDebit,
+                  note:
+                    effectiveDestiny === 'temporary'
+                      ? 'Entry posted as a temporary draft. Open it in Twinfield to review and finalise.'
+                      : 'Entry posted as final.',
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
+          isError: true,
+        };
+      }
+    },
+  );
+}
+
+function normalizeJournalDate(input: string): string {
+  // Accept YYYY-MM-DD, YYYY/MM/DD, or YYYYMMDD; emit YYYYMMDD.
+  const digits = input.replace(/[^0-9]/g, '');
+  if (!/^\d{8}$/.test(digits)) {
+    throw new Error(`Could not parse date "${input}". Use YYYY-MM-DD or YYYYMMDD.`);
+  }
+  return digits;
+}
+
+interface JournalResult {
+  success: boolean;
+  number?: number | string;
+  error?: string;
+}
+
+function normalizeJournalResult(result: unknown): JournalResult {
+  if (!result || typeof result !== 'object') return { success: false, error: 'Empty response from Twinfield.' };
+  const tx = ((result as Record<string, unknown>)['transaction'] ?? result) as Record<string, unknown>;
+  const r = tx['@_result'];
+
+  if (r === 1 || r === '1') {
+    const headerRaw = tx['header'];
+    const header = (Array.isArray(headerRaw) ? headerRaw[0] : headerRaw) as Record<string, unknown> | undefined;
+    const num = header?.['number'];
+    return { success: true, number: typeof num === 'number' || typeof num === 'string' ? num : undefined };
+  }
+
+  // Collect every `@_msg` Twinfield set anywhere in the response.
+  // Errors can appear at the transaction level, the line level, or — most
+  // commonly — on the individual field (e.g. `line.dim1.@_msg` when the
+  // dimension code isn't recognised).
+  const messages: string[] = [];
+  collectErrorMessages(tx, '', messages);
+  return {
+    success: false,
+    error:
+      messages.length > 0
+        ? messages.join(' | ')
+        : 'Twinfield rejected the journal (no message returned).',
+  };
+}
+
+function collectErrorMessages(node: unknown, path: string, out: string[]): void {
+  if (!node || typeof node !== 'object') return;
+  const obj = node as Record<string, unknown>;
+  const msg = obj['@_msg'];
+  if (typeof msg === 'string' && msg.length > 0) {
+    out.push(path ? `${path}: ${msg}` : msg);
+  }
+  for (const [key, value] of Object.entries(obj)) {
+    if (key.startsWith('@_') || key === '#text') continue;
+    if (Array.isArray(value)) {
+      value.forEach((item, idx) => collectErrorMessages(item, `${path ? path + '.' : ''}${key}[${idx}]`, out));
+    } else {
+      collectErrorMessages(value, path ? `${path}.${key}` : key, out);
+    }
+  }
 }

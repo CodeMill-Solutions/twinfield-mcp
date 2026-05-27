@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that co
 
 Built with Node.js, TypeScript, and [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk).
 
-> **Status: v0.2.0 — read-only.** Covers authentication, office discovery, dimension reads (customers, suppliers, GL accounts, cost centres, projects), and browse-based transaction reads (general transactions, sales invoices, purchase invoices). Write tools are planned for v0.3+.
+> **Status: v0.3.0 — read + first writes.** Authentication, full office details, dimension reads, browse-based transaction reads, plus the first three write tools: `upsert_customer`, `upsert_supplier`, and `process_journal` (with a `destiny="temporary"` safe default). Invoice writes (`process_sales_invoice`, `process_purchase_invoice`) and document uploads are planned for v0.4+.
 
 ---
 
@@ -134,7 +134,7 @@ When a new office entry is added externally — e.g. by running `npm run authori
 
 ---
 
-## Available tools (11)
+## Available tools (15)
 
 ### Authentication & setup
 
@@ -148,6 +148,7 @@ When a new office entry is added externally — e.g. by running `npm run authori
 | Tool | Description |
 |------|-------------|
 | `list_offices` | List all Twinfield offices (CompanyCodes) accessible with the current OAuth credentials. **Run this after `whoami`** to discover which office codes can be passed as the `office` parameter to other tools. |
+| `get_office` | Read full details for a single office: base currency, VAT/CoC numbers, default bank, region, address, fiscal config. Returns a curated summary plus the full raw response under `details`. |
 
 ### Dimensions (master data)
 
@@ -182,6 +183,16 @@ Built on Twinfield's `<columns code="100">` browse query. Each row in the respon
 - `openOnly?: boolean` — client-side post-filter that keeps only rows whose match status is `available` (only on `get_sales_invoices` / `get_purchase_invoices`).
 
 > **Note on daybook codes.** `VRK` and `INK` are the Dutch defaults (Verkoop / Inkoop). Offices on a non-Dutch Twinfield template may use different codes — run `get_transactions` once without filters and inspect the `daybook` field on the result to see what your office uses.
+
+### Write tools
+
+| Tool | Description |
+|------|-------------|
+| `upsert_customer` | Create or update a customer (Twinfield dimension type `DEB`). Idempotent on `code`. The allowed code format depends on the office configuration — Twinfield surfaces the exact pattern in the error message when the format is wrong. |
+| `upsert_supplier` | Create or update a supplier (Twinfield dimension type `CRD`). Same shape as `upsert_customer`. |
+| `process_journal` | Post a general journal entry (memoriaal) via `<transaction destiny="…">`. Validates client-side that lines balance to zero. Defaults to `destiny="temporary"` (draft) — the entry lands in Twinfield's UI as an editable proposal that you can review and finalise. Pass `destiny="final"` to commit immediately. Dimension codes are auto-padded to 4 digits where needed. |
+
+> **Why `destiny="temporary"` is the default.** Twinfield bookings are hard to unwind once final. The temporary status lets an agent propose an entry that you (the human) review and accept in the Twinfield UI before it touches the books. Override only when you have a deterministic write you trust.
 
 ---
 

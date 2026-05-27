@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { TwinfieldClient } from '../twinfield-client.js';
+import { TwinfieldClient, escapeXml } from '../twinfield-client.js';
 
 /**
  * Register office-related tools.
@@ -16,6 +16,8 @@ import { TwinfieldClient } from '../twinfield-client.js';
  * assumptions are all correct.
  */
 export function registerOfficeTools(server: McpServer, client: TwinfieldClient): void {
+  registerGetOfficeTool(server, client);
+
   server.registerTool(
     'list_offices',
     {
@@ -58,6 +60,112 @@ export function registerOfficeTools(server: McpServer, client: TwinfieldClient):
       }
     },
   );
+}
+
+/**
+ * Register the `get_office` tool.
+ *
+ * Twinfield's `<read><type>office>` requires BOTH `<office>` (context) and
+ * `<code>` (identifier), even when they refer to the same office. Without
+ * the `<code>` element Twinfield returns the unhelpful
+ * "U hebt geen toegang tot deze administratie." error.
+ *
+ * Surfaces a curated top-level slice (code, name, currencies, VAT/CoC
+ * numbers, address, etc.) plus the full raw response under `details` for
+ * agents that need more.
+ */
+function registerGetOfficeTool(server: McpServer, client: TwinfieldClient): void {
+  server.registerTool(
+    'get_office',
+    {
+      description:
+        'Read full details for a single Twinfield office (CompanyCode): base currency, ' +
+        'VAT and CoC numbers, default bank, region, address, fiscal year, and more. ' +
+        'For just a list of office codes use `list_offices`.',
+      inputSchema: {
+        office: z
+          .string()
+          .optional()
+          .describe('Office code to look up. Defaults to TWINFIELD_OFFICE_CODE.'),
+      },
+    },
+    async ({ office }) => {
+      try {
+        const resolvedOffice = office ?? client.defaultOfficeCode;
+        if (!resolvedOffice) {
+          throw new Error('No office code provided and TWINFIELD_OFFICE_CODE is not set.');
+        }
+        const result = await client.callProcessXml({
+          office: resolvedOffice,
+          xmlBody: `<read><type>office</type><office>${escapeXml(resolvedOffice)}</office><code>${escapeXml(resolvedOffice)}</code></read>`,
+        });
+
+        const summary = summarizeOffice(result);
+        if (!summary) {
+          throw new Error(`Twinfield returned an unexpected shape for office "${resolvedOffice}".`);
+        }
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ success: true, office: summary, details: result }, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
+          isError: true,
+        };
+      }
+    },
+  );
+}
+
+/** Extract a flat summary from the parsed `<read type="office">` response. */
+function summarizeOffice(result: unknown): Record<string, unknown> | null {
+  if (!result || typeof result !== 'object') return null;
+  const rec = result as Record<string, unknown>;
+  const officeRaw = rec['office'];
+  const office = (Array.isArray(officeRaw) ? officeRaw[0] : officeRaw) as Record<string, unknown> | undefined;
+  if (!office) return null;
+
+  const general = office['general'] as Record<string, unknown> | undefined;
+  const address = (general?.['address'] ?? {}) as Record<string, unknown>;
+
+  return {
+    code: text(office['code']),
+    name: text(office['name']),
+    shortname: text(office['shortname']) || undefined,
+    baseCurrency: text(general?.['basecurrency']),
+    reportingCurrency: text(general?.['reportingcurrency']),
+    type: text(general?.['type']),
+    demo: general?.['demo'] === true || general?.['demo'] === 'true',
+    vatNumber: text(general?.['vatnumber']) || undefined,
+    cocNumber: text(general?.['cocnumber']) || undefined,
+    defaultBank: text(general?.['defaultbank']) || undefined,
+    region: text(general?.['region']) || undefined,
+    hierarchy: text(general?.['hierarchy']) || undefined,
+    address: {
+      city: text(address['city']) || undefined,
+      country: text(address['country']) || undefined,
+    },
+    created: text(office['created']) || undefined,
+    modified: text(office['modified']) || undefined,
+  };
+}
+
+function text(v: unknown): string {
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return String(v);
+  if (typeof v === 'object' && '#text' in v) {
+    const t = (v as Record<string, unknown>)['#text'];
+    if (typeof t === 'string' || typeof t === 'number') return String(t);
+  }
+  return '';
 }
 
 /**
