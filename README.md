@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that co
 
 Built with Node.js, TypeScript, and [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk).
 
-> **Status: v0.3.0 — read + first writes.** Authentication, full office details, dimension reads, browse-based transaction reads, plus the first three write tools: `upsert_customer`, `upsert_supplier`, and `process_journal` (with a `destiny="temporary"` safe default). Invoice writes (`process_sales_invoice`, `process_purchase_invoice`) and document uploads are planned for v0.4+.
+> **Status: v0.4.0 — full read + write surface.** Authentication, office details, dimension reads (now covering both `BAS` balance-sheet and `PNL` profit-and-loss accounts), browse-based transaction reads, dimension upserts + deactivation, and the three core financial writes: `process_journal`, `process_sales_invoice`, `process_purchase_invoice`. All writes default to `destiny="temporary"` (draft) for safety. Document upload is planned for v0.5+.
 
 ---
 
@@ -134,7 +134,7 @@ When a new office entry is added externally — e.g. by running `npm run authori
 
 ---
 
-## Available tools (15)
+## Available tools (18)
 
 ### Authentication & setup
 
@@ -158,11 +158,11 @@ Twinfield models customers, suppliers, GL accounts, cost centres, and projects a
 |------|---------|-------------|
 | `get_customers` | DEB | List all customers (debtors) for an office. |
 | `get_suppliers` | CRD | List all suppliers / vendors (creditors) for an office. |
-| `get_gl_accounts` | BAS | List all GL accounts (balance sheet) for an office. |
+| `get_gl_accounts` | BAS + PNL | List all GL accounts. Combines balance-sheet (BAS) and profit-and-loss (PNL) into one response; each entry includes `glType` so revenue/cost lines (PNL) are distinguishable from balance positions (BAS). Optional `glType` parameter narrows to one side. |
 | `get_cost_centers` | KPL | List all cost centres for an office. |
 | `get_projects` | PRJ | List all projects for an office. |
 
-All dimension tools return an array of `{ code, name?, shortname? }` entries.
+All dimension tools return an array of `{ code, name?, shortname?, glType? }` entries.
 
 ### Transactions (browse queries)
 
@@ -184,15 +184,27 @@ Built on Twinfield's `<columns code="100">` browse query. Each row in the respon
 
 > **Note on daybook codes.** `VRK` and `INK` are the Dutch defaults (Verkoop / Inkoop). Offices on a non-Dutch Twinfield template may use different codes — run `get_transactions` once without filters and inspect the `daybook` field on the result to see what your office uses.
 
-### Write tools
+### Write tools — master data
 
 | Tool | Description |
 |------|-------------|
 | `upsert_customer` | Create or update a customer (Twinfield dimension type `DEB`). Idempotent on `code`. The allowed code format depends on the office configuration — Twinfield surfaces the exact pattern in the error message when the format is wrong. |
 | `upsert_supplier` | Create or update a supplier (Twinfield dimension type `CRD`). Same shape as `upsert_customer`. |
-| `process_journal` | Post a general journal entry (memoriaal) via `<transaction destiny="…">`. Validates client-side that lines balance to zero. Defaults to `destiny="temporary"` (draft) — the entry lands in Twinfield's UI as an editable proposal that you can review and finalise. Pass `destiny="final"` to commit immediately. Dimension codes are auto-padded to 4 digits where needed. |
+| `deactivate_dimension` | Soft-delete a customer / supplier / cost-centre / project by marking it inactive (Twinfield does not allow true deletes for dimensions with transaction history). The current name is preserved automatically — Twinfield requires it on every dimension upsert. |
+
+### Write tools — transactions
+
+| Tool | Description |
+|------|-------------|
+| `process_journal` | Post a general journal entry (memoriaal) via `<transaction destiny="…">`. Validates client-side that lines balance to zero. Dimension codes are auto-padded to 4 digits where needed. |
+| `process_sales_invoice` | Book a sales invoice via the `VRK` daybook. Composes the `<transaction>` with `<invoicenumber>` + optional `<duedate>`, a `type="total"` debtor line (default GL `1300`), and one or more revenue lines with optional `<vatcode>` (sales codes start with `V`: `VH` = 21%, `VL` = 9%, `VN` = 0% / vrijgesteld). Twinfield auto-generates the VAT booking from the code. |
+| `process_purchase_invoice` | Symmetric sibling: posts to the `INK` daybook with a creditor total line (default GL `1600`) and cost lines using purchase-side VAT codes (`IH`, `IL`, `IN`). |
+
+All transaction writes default to `destiny="temporary"` (draft) — the entry lands in Twinfield's UI as an editable proposal you can review and finalise. Pass `destiny="final"` to commit immediately.
 
 > **Why `destiny="temporary"` is the default.** Twinfield bookings are hard to unwind once final. The temporary status lets an agent propose an entry that you (the human) review and accept in the Twinfield UI before it touches the books. Override only when you have a deterministic write you trust.
+
+> **Sales vs. purchase VAT codes are NOT interchangeable.** Twinfield uses two distinct prefixes — `V*` (Verkoop / sales) and `I*` (Inkoop / purchase). Using `VH` on a purchase invoice errors with "BTW Hoog (VH) is van het type Verkoop terwijl het dagboek van het btw-type Inkoop is." The tools default to sensible per-daybook codes but pass whatever your account uses.
 
 ---
 

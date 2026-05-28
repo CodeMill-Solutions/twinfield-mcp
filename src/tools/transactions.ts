@@ -58,6 +58,16 @@ export function registerTransactionTools(server: McpServer, client: TwinfieldCli
   });
 
   registerProcessJournalTool(server, client);
+  registerProcessInvoiceTool(server, client, {
+    name: 'process_sales_invoice',
+    daybook: 'VRK',
+    side: 'sales',
+  });
+  registerProcessInvoiceTool(server, client, {
+    name: 'process_purchase_invoice',
+    daybook: 'INK',
+    side: 'purchase',
+  });
 }
 
 interface TransactionToolSpec {
@@ -462,6 +472,239 @@ function normalizeJournalResult(result: unknown): JournalResult {
         ? messages.join(' | ')
         : 'Twinfield rejected the journal (no message returned).',
   };
+}
+
+// ── process_sales_invoice / process_purchase_invoice (writes) ────────────────
+
+interface InvoiceToolSpec {
+  name: string;
+  /** Daybook code used by default (`VRK` for sales, `INK` for purchase). */
+  daybook: string;
+  /** Determines debit/credit signs and which counterparty label we use. */
+  side: 'sales' | 'purchase';
+}
+
+/**
+ * Register a sales- or purchase-invoice write tool.
+ *
+ * Twinfield invoice bookings reuse the same `<transaction>` envelope as
+ * journal entries, but with:
+ *   - daybook = VRK (sales) or INK (purchase)
+ *   - `<invoicenumber>` and `<duedate>` in the header
+ *   - a `type="total"` line carrying dim1=debtor/creditor GL (default 1300
+ *     for sales / 1600 for purchase) and dim2=counterparty code
+ *   - one or more revenue/cost lines with optional `<vatcode>` — Twinfield
+ *     auto-derives the VAT booking from the vatcode rather than requiring a
+ *     separate VAT line in the XML
+ *
+ * Sign convention:
+ *   - Sales invoice (we receive money later): total = debit, revenue = credit
+ *   - Purchase invoice (we owe money): total = credit, cost = debit
+ *
+ * `destiny="temporary"` is the safe default — the invoice lands as a draft
+ * the user can review in the Twinfield UI before finalising.
+ */
+function registerProcessInvoiceTool(server: McpServer, client: TwinfieldClient, spec: InvoiceToolSpec): void {
+  const isSales = spec.side === 'sales';
+  const counterpartyLabel = isSales ? 'customer' : 'supplier';
+  const counterpartyKind = isSales ? 'DEB' : 'CRD';
+  const defaultTotalGL = isSales ? '1300' : '1600';
+  const totalGLLabel = isSales ? 'debtor (Debiteuren, typically 1300)' : 'creditor (Crediteuren, typically 1600)';
+  const lineGLLabel = isSales ? 'revenue GL (P&L)' : 'cost / expense GL (P&L)';
+
+  const invoiceLineSchema = z.object({
+    glAccount: z.string().min(1).describe(`The ${lineGLLabel}. Numeric codes are auto-padded to 4 digits.`),
+    amount: z
+      .number()
+      .describe(
+        'Net amount (excluding VAT) for this line. Always positive — the sign is derived from the invoice side.',
+      ),
+    vatCode: z
+      .string()
+      .optional()
+      .describe(
+        'Twinfield VAT code (e.g. `VH` for hoog tarief 21%, `VL` for laag tarief 9%, `VN` for nul/vrijgesteld). ' +
+          'Twinfield auto-generates the VAT booking; you only need to supply the code, not a separate VAT line.',
+      ),
+    description: z.string().optional().describe('Free-text description for this invoice line.'),
+    costCenter: z.string().optional().describe('Optional cost-centre code (becomes dim3).'),
+  });
+
+  server.registerTool(
+    spec.name,
+    {
+      description:
+        `Book a ${spec.side} invoice via Twinfield's ${spec.daybook} daybook. The total line ` +
+        `lands on the ${totalGLLabel} account; each invoice line is posted to its own P&L ` +
+        `account with an optional VAT code that Twinfield uses to auto-generate the VAT booking. ` +
+        `Defaults to \`destiny="temporary"\` (draft) so you can review the invoice in the ` +
+        `Twinfield UI before finalising. Returns the assigned transaction number on success.`,
+      inputSchema: {
+        office: z.string().optional().describe('Office code. Defaults to TWINFIELD_OFFICE_CODE.'),
+        daybook: z
+          .string()
+          .optional()
+          .describe(`Daybook code. Defaults to \`${spec.daybook}\`.`),
+        date: z.string().describe('Booking date in `YYYY-MM-DD` or `YYYYMMDD` format.'),
+        period: z
+          .string()
+          .regex(/^\d{4}\/\d{2}$/, 'Period must be in YYYY/PP format, e.g. 2024/01')
+          .describe('Fiscal period in `YYYY/PP` format.'),
+        invoiceNumber: z
+          .string()
+          .min(1)
+          .describe(`Invoice number as it appears on the printed invoice (your reference for the ${counterpartyLabel}).`),
+        dueDate: z
+          .string()
+          .optional()
+          .describe('Due date in `YYYY-MM-DD` or `YYYYMMDD` format. Optional — Twinfield can derive it from terms.'),
+        [counterpartyLabel]: z
+          .string()
+          .min(1)
+          .describe(`Code of the ${counterpartyLabel} (Twinfield dimension type ${counterpartyKind}).`),
+        totalAmount: z
+          .number()
+          .positive()
+          .describe('Gross invoice total (including VAT). Always positive.'),
+        lines: z
+          .array(invoiceLineSchema)
+          .min(1)
+          .describe('Invoice lines. Each line is one P&L posting with an optional VAT code.'),
+        totalGLAccount: z
+          .string()
+          .optional()
+          .describe(`GL code for the total line. Defaults to \`${defaultTotalGL}\` (${totalGLLabel}).`),
+        currency: z.string().optional().describe('ISO currency code. Defaults to `EUR`.'),
+        destiny: z
+          .enum(['temporary', 'final'])
+          .optional()
+          .describe('`temporary` (default) creates a draft. `final` commits immediately.'),
+      },
+    },
+    async (args) => {
+      try {
+        const office = (args as Record<string, unknown>)['office'] as string | undefined;
+        const daybook = (args as Record<string, unknown>)['daybook'] as string | undefined;
+        const date = (args as Record<string, unknown>)['date'] as string;
+        const period = (args as Record<string, unknown>)['period'] as string;
+        const invoiceNumber = (args as Record<string, unknown>)['invoiceNumber'] as string;
+        const dueDate = (args as Record<string, unknown>)['dueDate'] as string | undefined;
+        const counterparty = (args as Record<string, unknown>)[counterpartyLabel] as string;
+        const totalAmount = (args as Record<string, unknown>)['totalAmount'] as number;
+        const lines = (args as Record<string, unknown>)['lines'] as Array<{
+          glAccount: string;
+          amount: number;
+          vatCode?: string;
+          description?: string;
+          costCenter?: string;
+        }>;
+        const totalGLAccount = (args as Record<string, unknown>)['totalGLAccount'] as string | undefined;
+        const currency = (args as Record<string, unknown>)['currency'] as string | undefined;
+        const destiny = (args as Record<string, unknown>)['destiny'] as 'temporary' | 'final' | undefined;
+
+        const resolvedOffice = office ?? client.defaultOfficeCode;
+        if (!resolvedOffice) {
+          throw new Error('No office code provided and TWINFIELD_OFFICE_CODE is not set.');
+        }
+
+        const effectiveDaybook = daybook ?? spec.daybook;
+        const effectiveCurrency = currency ?? 'EUR';
+        const effectiveDestiny = destiny ?? 'temporary';
+        const effectiveTotalGL = totalGLAccount ?? defaultTotalGL;
+        const normalizedDate = normalizeJournalDate(date);
+        const normalizedDueDate = dueDate ? normalizeJournalDate(dueDate) : undefined;
+
+        // Sales: total=debit, revenue=credit. Purchase: total=credit, cost=debit.
+        const totalSide = isSales ? 'debit' : 'credit';
+        const lineSide = isSales ? 'credit' : 'debit';
+
+        const headerParts = [
+          `<office>${escapeXml(resolvedOffice)}</office>`,
+          `<code>${escapeXml(effectiveDaybook)}</code>`,
+          `<date>${escapeXml(normalizedDate)}</date>`,
+          `<period>${escapeXml(period)}</period>`,
+          `<currency>${escapeXml(effectiveCurrency)}</currency>`,
+          `<invoicenumber>${escapeXml(invoiceNumber)}</invoicenumber>`,
+          ...(normalizedDueDate ? [`<duedate>${escapeXml(normalizedDueDate)}</duedate>`] : []),
+        ];
+
+        const totalLineXml =
+          `<line id="1" type="total">` +
+          `<dim1>${escapeXml(padDimensionCode(effectiveTotalGL))}</dim1>` +
+          `<dim2>${escapeXml(padDimensionCode(counterparty))}</dim2>` +
+          `<value>${totalAmount.toFixed(2)}</value>` +
+          `<debitcredit>${totalSide}</debitcredit>` +
+          `<description>${escapeXml(`Invoice ${invoiceNumber}`)}</description>` +
+          `</line>`;
+
+        const detailLinesXml = lines
+          .map((l, i) => {
+            const parts = [
+              `<dim1>${escapeXml(padDimensionCode(l.glAccount))}</dim1>`,
+              ...(l.costCenter ? [`<dim3>${escapeXml(padDimensionCode(l.costCenter))}</dim3>`] : []),
+              `<value>${l.amount.toFixed(2)}</value>`,
+              `<debitcredit>${lineSide}</debitcredit>`,
+              ...(l.vatCode ? [`<vatcode>${escapeXml(l.vatCode)}</vatcode>`] : []),
+              ...(l.description ? [`<description>${escapeXml(l.description)}</description>`] : []),
+            ];
+            return `<line id="${i + 2}" type="detail">${parts.join('')}</line>`;
+          })
+          .join('');
+
+        const xmlBody = `<transaction destiny="${escapeXml(effectiveDestiny)}">
+          <header>${headerParts.join('')}</header>
+          <lines>${totalLineXml}${detailLinesXml}</lines>
+        </transaction>`;
+
+        const result = await client.callProcessXml({ office: resolvedOffice, xmlBody });
+
+        const normalized = normalizeJournalResult(result);
+        if (!normalized.success) {
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify({ success: false, error: normalized.error }, null, 2) },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  office: resolvedOffice,
+                  daybook: effectiveDaybook,
+                  number: normalized.number,
+                  invoiceNumber,
+                  date: normalizedDate,
+                  period,
+                  destiny: effectiveDestiny,
+                  [counterpartyLabel]: counterparty,
+                  totalAmount,
+                  lineCount: lines.length,
+                  note:
+                    effectiveDestiny === 'temporary'
+                      ? 'Invoice posted as a temporary draft. Open it in Twinfield to review and finalise.'
+                      : 'Invoice posted as final.',
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
+          isError: true,
+        };
+      }
+    },
+  );
 }
 
 function collectErrorMessages(node: unknown, path: string, out: string[]): void {

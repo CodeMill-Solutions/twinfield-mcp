@@ -44,14 +44,7 @@ export function registerDimensionTools(server: McpServer, client: TwinfieldClien
       'Returns an array of `{ code, name, shortname? }` entries.',
   });
 
-  registerDimensionListTool(server, client, {
-    name: 'get_gl_accounts',
-    dimtype: 'BAS',
-    description:
-      'List all general ledger accounts (Twinfield dimensions of type BAS) for an office. ' +
-      'Returns an array of `{ code, name, shortname? }` entries — useful for resolving ' +
-      'GL codes when reading or writing journal entries.',
-  });
+  registerGlAccountsTool(server, client);
 
   registerDimensionListTool(server, client, {
     name: 'get_cost_centers',
@@ -90,6 +83,75 @@ export function registerDimensionTools(server: McpServer, client: TwinfieldClien
       'allowed code format depends on the office configuration — Dutch templates typically ' +
       'use 4-digit codes in the 2000–2999 range.',
   });
+
+  registerDeactivateDimensionTool(server, client);
+}
+
+/**
+ * `get_gl_accounts` — list ALL general ledger accounts (both balance-sheet
+ * BAS and profit-and-loss PNL types). v0.3.0 returned only BAS, hiding ~half
+ * of a typical chart of accounts; this fix queries both in parallel and
+ * tags each entry with its `glType` so callers can distinguish revenue/cost
+ * lines from balance-sheet positions.
+ */
+function registerGlAccountsTool(server: McpServer, client: TwinfieldClient): void {
+  server.registerTool(
+    'get_gl_accounts',
+    {
+      description:
+        'List all general ledger accounts for an office. Combines Twinfield\'s `BAS` ' +
+        '(balance-sheet) and `PNL` (profit-and-loss) dimension types into one response. ' +
+        'Each entry includes `glType` so you can identify revenue/cost accounts (PNL) vs. ' +
+        'positions on the balance sheet (BAS). Use `glType` filter to narrow.',
+      inputSchema: {
+        office: z
+          .string()
+          .optional()
+          .describe('Office code (CompanyCode). Defaults to TWINFIELD_OFFICE_CODE.'),
+        glType: z
+          .enum(['BAS', 'PNL'])
+          .optional()
+          .describe('Optional filter — `BAS` for balance-sheet only, `PNL` for profit-and-loss only. Omit for both.'),
+      },
+    },
+    async ({ office, glType }) => {
+      try {
+        const resolvedOffice = office ?? client.defaultOfficeCode;
+        if (!resolvedOffice) {
+          throw new Error('No office code provided and TWINFIELD_OFFICE_CODE is not set.');
+        }
+        const types = glType ? [glType] : ['BAS' as const, 'PNL' as const];
+        const results = await Promise.all(
+          types.map(async (type) => {
+            const r = await client.callProcessXml({
+              office: resolvedOffice,
+              xmlBody: `<list><type>dimensions</type><office>${resolvedOffice}</office><dimtype>${type}</dimtype></list>`,
+            });
+            return normalizeDimensions(r, type).map((d) => ({ ...d, glType: type }));
+          }),
+        );
+        const dimensions = results.flat();
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                { success: true, office: resolvedOffice, count: dimensions.length, dimensions },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
+          isError: true,
+        };
+      }
+    },
+  );
 }
 
 interface DimensionToolSpec {
@@ -342,6 +404,110 @@ function normalizeDimensionUpsertResult(result: unknown): DimensionUpsertResult 
     error: (typeof dimMsg === 'string' ? dimMsg : typeof rootMsg === 'string' ? rootMsg : undefined) ??
       'Twinfield rejected the dimension upsert (no message returned).',
   };
+}
+
+/**
+ * Register `deactivate_dimension` — soft-delete a dimension (customer,
+ * supplier, etc.) by sending `<dimension status="inactive">`. Twinfield
+ * does not allow truly deleting dimensions that have transaction history;
+ * deactivation is the closest thing to a delete.
+ *
+ * Twinfield requires the `<name>` element on every dimension upsert,
+ * including deactivation — we look up the current name with a `<read>`
+ * first so the agent doesn't have to remember it.
+ */
+function registerDeactivateDimensionTool(server: McpServer, client: TwinfieldClient): void {
+  server.registerTool(
+    'deactivate_dimension',
+    {
+      description:
+        'Deactivate a Twinfield dimension (customer, supplier, project, …) by marking it ' +
+        'inactive. This is the closest thing to a delete — Twinfield retains dimensions ' +
+        'with transaction history but hides inactive ones from new postings. The current ' +
+        'name is preserved (Twinfield requires it on every dimension upsert).',
+      inputSchema: {
+        dimtype: z
+          .enum(['DEB', 'CRD', 'KPL', 'PRJ'])
+          .describe('Dimension type: DEB (customer), CRD (supplier), KPL (cost centre), PRJ (project).'),
+        code: z.string().min(1).describe('Code of the dimension to deactivate.'),
+        office: z.string().optional().describe('Office code. Defaults to TWINFIELD_OFFICE_CODE.'),
+      },
+    },
+    async ({ dimtype, code, office }) => {
+      try {
+        const resolvedOffice = office ?? client.defaultOfficeCode;
+        if (!resolvedOffice) {
+          throw new Error('No office code provided and TWINFIELD_OFFICE_CODE is not set.');
+        }
+
+        // First read the current dimension so we can preserve its name.
+        const readResult = await client.callProcessXml({
+          office: resolvedOffice,
+          xmlBody: `<read><type>dimensions</type><office>${escapeXml(resolvedOffice)}</office><dimtype>${escapeXml(dimtype)}</dimtype><code>${escapeXml(code)}</code></read>`,
+        });
+        const currentName = extractDimensionName(readResult);
+        if (!currentName) {
+          throw new Error(`Could not read dimension ${dimtype}/${code} on office ${resolvedOffice}.`);
+        }
+
+        const result = await client.callProcessXml({
+          office: resolvedOffice,
+          xmlBody:
+            `<dimensions><dimension status="inactive">` +
+            `<office>${escapeXml(resolvedOffice)}</office>` +
+            `<type>${escapeXml(dimtype)}</type>` +
+            `<code>${escapeXml(code)}</code>` +
+            `<name>${escapeXml(currentName)}</name>` +
+            `</dimension></dimensions>`,
+        });
+
+        const normalized = normalizeDimensionUpsertResult(result);
+        if (!normalized.success) {
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify({ success: false, error: normalized.error }, null, 2) },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  office: resolvedOffice,
+                  dimtype,
+                  code: normalized.code,
+                  name: normalized.name,
+                  status: normalized.status ?? 'inactive',
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: message }, null, 2) }],
+          isError: true,
+        };
+      }
+    },
+  );
+}
+
+function extractDimensionName(readResult: unknown): string | undefined {
+  if (!readResult || typeof readResult !== 'object') return undefined;
+  const dimRaw = (readResult as Record<string, unknown>)['dimension'];
+  const dim = (Array.isArray(dimRaw) ? dimRaw[0] : dimRaw) as Record<string, unknown> | undefined;
+  if (!dim) return undefined;
+  const name = dim['name'];
+  return typeof name === 'string' ? name : undefined;
 }
 
 function stringOrUndef(v: unknown): string | undefined {

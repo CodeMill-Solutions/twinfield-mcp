@@ -80,7 +80,7 @@ const twinfieldClient = new TwinfieldClient(defaultOffice, credentialsMap);
 
 const server = new McpServer({
   name: 'twinfield-mcp',
-  version: '0.3.0',
+  version: '0.4.0',
 });
 
 registerAuthTools(server, twinfieldClient);
@@ -100,9 +100,10 @@ const credInfo =
     : 'no credentials configured';
 
 process.stderr.write(
-  `[twinfield-mcp] Server started — 15 tools registered ` +
+  `[twinfield-mcp] Server started — 18 tools registered ` +
     `(whoami, reload_credentials, list_offices, get_office, get_customers, get_suppliers, ` +
     `get_gl_accounts, get_cost_centers, get_projects, get_transactions, get_sales_invoices, ` +
-    `get_purchase_invoices, upsert_customer, upsert_supplier, process_journal). ` +
+    `get_purchase_invoices, upsert_customer, upsert_supplier, deactivate_dimension, ` +
+    `process_journal, process_sales_invoice, process_purchase_invoice). ` +
     `Default office: ${defaultOffice || '(none)'} — ${credInfo}\n`,
 );

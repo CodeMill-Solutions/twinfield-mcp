@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-27
+
+### Added
+
+- `process_sales_invoice` — book a sales invoice via Twinfield's `VRK`
+  daybook. Composes the `<transaction>` with `<invoicenumber>`, optional
+  `<duedate>`, a `type="total"` debtor line, and one or more revenue lines
+  with optional `<vatcode>` (Twinfield auto-generates the VAT booking).
+- `process_purchase_invoice` — symmetric tool for the `INK` daybook (total
+  on creditor, cost lines with purchase-side VAT codes like `IH`/`IL`).
+- `deactivate_dimension` — soft-delete a customer/supplier/cost-centre/
+  project by sending `<dimension status="inactive">`. Twinfield requires
+  the `<name>` element on every dimension upsert; the tool reads the
+  current name first and preserves it so callers don't have to.
+
+### Fixed
+
+- **`get_gl_accounts` was missing ~half the chart of accounts.** v0.3.0
+  only queried Twinfield's `BAS` (balance-sheet) dimension type, hiding
+  every `PNL` (profit-and-loss) account — including all revenue and
+  expense GLs. v0.4.0 queries both in parallel and tags each entry with a
+  `glType` field (`BAS` or `PNL`). A new optional `glType` parameter
+  filters to one side when desired. On a typical Dutch RGS template this
+  bumps the result from ~150 to ~340 entries.
+
+### Notes on Twinfield invoice quirks (discovered + documented in code)
+
+- Sales VAT codes (`VH`, `VL`, `VN`, …) are NOT interchangeable with
+  purchase VAT codes (`IH`, `IL`, `IN`, …). Twinfield rejects with a clear
+  message — but the prefix convention is V*erkoop* / I*nkoop*.
+- Dimension deactivation accepts the `status="inactive"` attribute on
+  `<dimension>` but still requires `<name>` (otherwise: "Naam moet worden
+  ingevuld"). The `<inactive>` element variant is rejected like `<inuse>`.
+- Revenue / cost GL accounts live under dimension type `PNL`, not `BAS`.
+  A typical sales invoice books its total line to a `BAS` debtor account
+  (1300) and its detail lines to `PNL` revenue accounts (e.g. 8020 "Omzet
+  diversen"). Twinfield's `_dimensiontype` attribute on read responses
+  confirms which type each account belongs to.
+
 ## [0.3.0] - 2026-05-27
 
 ### Added
